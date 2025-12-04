@@ -216,7 +216,6 @@ func (c *Client) WriteMessageSlice(dataSlice [][]byte) (err error) {
 		return err
 	}
 	for i, data := range dataSlice {
-		data = data
 		if i > 0 {
 			_, err = w.Write([]byte{'\n'})
 			if err != nil {
@@ -278,6 +277,7 @@ func (c *Client) Start(parentCtx context.Context, messageFunc func(message []byt
 	// Create connection
 	err = c.connect(ctx)
 	if err != nil {
+		defer cancel()
 		return err
 	}
 	defer c.conn.Close()
@@ -286,6 +286,12 @@ func (c *Client) Start(parentCtx context.Context, messageFunc func(message []byt
 	c.conn.SetReadLimit(c.MaxMessageSize)
 	c.conn.SetReadDeadline(time.Now().Add(c.PongWait))
 	c.conn.SetPongHandler(func(string) error { c.conn.SetReadDeadline(time.Now().Add(c.PongWait)); return nil })
+
+	// Force close connection on context cancellation to unblock ReadMessage()
+	go func() {
+		<-ctx.Done()
+		c.conn.Close() // This will cause ReadMessage() to return immediately with an error
+	}()
 
 	// Read and process websocket messages
 	messageErrCh := make(chan error, 1)
