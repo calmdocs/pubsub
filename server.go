@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -53,6 +54,10 @@ type Store struct {
 
 	// Broadcast rate limit tracker
 	lastBroadcastAt time.Time
+
+	// Cleanup synchronization to prevent double-close panics
+	closeOnce sync.Once   // Ensures channel and connection are closed exactly once
+	deleted   atomic.Bool // Atomic flag to prevent concurrent cleanup attempts
 }
 
 // NewServer returns a new websockets server with default settings.
@@ -211,10 +216,15 @@ func (s *Server) closeAll() {
 }
 
 func (s *Server) deleteStoreFromMap(channel string, st *Store) {
-	st.Lock()
-	defer st.Unlock()
+	// Use closeOnce to ensure channel and connection are closed exactly once
+	// This prevents "close of closed channel" panic from concurrent cleanup attempts
+	st.closeOnce.Do(func() {
+		close(st.sendCh)
+		st.Lock()
+		st.conn.Close()
+		st.Unlock()
+	})
 
-	close(st.sendCh)
 	delete(s.m[channel], st)
 	if len(s.m[channel]) == 0 {
 		delete(s.m, channel)
@@ -247,6 +257,12 @@ func (s *Server) registerStore(channel string, storeLimit int64, st *Store) erro
 }
 
 func (s *Server) unregisterStore(channel string, st *Store) {
+	// Use atomic flag to prevent concurrent cleanup attempts
+	if !st.deleted.CompareAndSwap(false, true) {
+		// Already deleted by another goroutine
+		return
+	}
+
 	s.Lock()
 	defer s.Unlock()
 
@@ -279,18 +295,18 @@ func (s *Server) broadcastMessage(channel string, data []byte) {
 		select {
 		case st.sendCh <- data:
 		default:
-			s.deleteStoreFromMap(channel, st)
+			// Use atomic flag to prevent concurrent cleanup attempts
+			if st.deleted.CompareAndSwap(false, true) {
+				s.deleteStoreFromMap(channel, st)
+			}
 		}
 	}
 }
 
 func (s *Server) readAndBroadcastStoreMessages(channel string, st *Store) (err error) {
 	defer func() {
+		// unregisterStore will handle closing connection and channel via closeOnce
 		s.unregisterStore(channel, st)
-
-		st.Lock()
-		st.conn.Close()
-		st.Unlock()
 	}()
 	st.Lock()
 	st.conn.SetReadLimit(s.maxMessageSize)
@@ -347,10 +363,7 @@ func (s *Server) writeStoreMessages(st *Store) {
 	ticker := time.NewTicker(s.pingPeriod)
 	defer func() {
 		ticker.Stop()
-
-		st.Lock()
-		st.conn.Close()
-		st.Unlock()
+		// Connection cleanup is handled by unregisterStore via closeOnce
 	}()
 
 	for {
@@ -364,7 +377,7 @@ func (s *Server) writeStoreMessages(st *Store) {
 				st.Lock()
 				st.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				st.Unlock()
-				return // Note that returning here calls st.conn.Close() in the defer function above
+				return
 			}
 
 			// Do not stream messages from other connections to this connection if not permitted to do so
@@ -376,7 +389,7 @@ func (s *Server) writeStoreMessages(st *Store) {
 			err := st.conn.WriteMessage(websocket.TextMessage, data)
 			st.Unlock()
 			if err != nil {
-				return // Note that returning here calls st.conn.Close() in the defer function above
+				return
 			}
 		case <-ticker.C:
 			st.Lock()
@@ -384,7 +397,7 @@ func (s *Server) writeStoreMessages(st *Store) {
 			err := st.conn.WriteMessage(websocket.PingMessage, []byte{})
 			st.Unlock()
 			if err != nil {
-				return // Note that returning here calls st.conn.Close() in the defer function above
+				return
 			}
 		}
 	}
