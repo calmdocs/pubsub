@@ -18,17 +18,26 @@ import (
 var ErrUnauthorized = errors.New("websocket dial unauthorized")
 
 // DialError wraps a websocket dial failure together with the HTTP status
-// code from the response (0 if no response was received).
+// code from the response (0 if no response was received) and the optional
+// X-Reject-Reason header set by the sync server to classify auth failures
+// (e.g. "jwt-expired", "jwt-malformed", "group-access-denied"). Empty when
+// the server did not set the header (older server, generic 401, network
+// error before any HTTP response).
 type DialError struct {
-	Err        error
-	StatusCode int
+	Err          error
+	StatusCode   int
+	RejectReason string
 }
 
 func (e *DialError) Error() string {
-	if e.StatusCode != 0 {
+	switch {
+	case e.RejectReason != "":
+		return fmt.Sprintf("DialContext dial: %s (status %d, reject-reason %q)", e.Err.Error(), e.StatusCode, e.RejectReason)
+	case e.StatusCode != 0:
 		return fmt.Sprintf("DialContext dial: %s (status %d)", e.Err.Error(), e.StatusCode)
+	default:
+		return fmt.Sprintf("DialContext dial: %s", e.Err.Error())
 	}
-	return fmt.Sprintf("DialContext dial: %s", e.Err.Error())
 }
 
 func (e *DialError) Unwrap() error { return e.Err }
@@ -294,6 +303,7 @@ func (c *Client) connect(ctx context.Context) (err error) {
 		de := &DialError{Err: err}
 		if resp != nil {
 			de.StatusCode = resp.StatusCode
+			de.RejectReason = resp.Header.Get("X-Reject-Reason")
 		}
 		return de
 	}

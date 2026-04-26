@@ -18,8 +18,11 @@ import (
 // TestConnectUnauthorizedTyped asserts that a 401 from the WS upgrade is
 // surfaced as a *DialError matching ErrUnauthorized via errors.Is, with
 // the StatusCode populated and "status 401" present in the error string.
+// Also asserts the X-Reject-Reason header is captured into DialError.RejectReason
+// when set by the server, and that the formatted error string includes it.
 func TestConnectUnauthorizedTyped(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Reject-Reason", "jwt-expired")
 		w.WriteHeader(http.StatusUnauthorized)
 	}))
 	defer srv.Close()
@@ -40,6 +43,9 @@ func TestConnectUnauthorizedTyped(t *testing.T) {
 	if !strings.Contains(err.Error(), "status 401") {
 		t.Fatalf("expected error string to contain \"status 401\"; got: %s", err.Error())
 	}
+	if !strings.Contains(err.Error(), `reject-reason "jwt-expired"`) {
+		t.Fatalf("expected error string to surface reject-reason; got: %s", err.Error())
+	}
 
 	var de *DialError
 	if !errors.As(err, &de) {
@@ -47,6 +53,40 @@ func TestConnectUnauthorizedTyped(t *testing.T) {
 	}
 	if de.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected StatusCode 401; got %d", de.StatusCode)
+	}
+	if de.RejectReason != "jwt-expired" {
+		t.Fatalf("expected RejectReason \"jwt-expired\"; got %q", de.RejectReason)
+	}
+}
+
+// TestConnectUnauthorizedNoRejectReason asserts that a 401 without an
+// X-Reject-Reason header (older servers, generic 401) leaves DialError.RejectReason
+// empty, and the formatted error falls back to the original "(status %d)" form.
+func TestConnectUnauthorizedNoRejectReason(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	host := strings.TrimPrefix(srv.URL, "http://")
+
+	c := NewClientWithBearerToken(host, "any-token", false, "/ws", "1")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := c.Start(ctx, func(message []byte) error { return nil })
+	if err == nil {
+		t.Fatalf("expected error from 401 dial, got nil")
+	}
+	var de *DialError
+	if !errors.As(err, &de) {
+		t.Fatalf("expected *DialError; got: %T", err)
+	}
+	if de.RejectReason != "" {
+		t.Fatalf("expected empty RejectReason; got %q", de.RejectReason)
+	}
+	if strings.Contains(err.Error(), "reject-reason") {
+		t.Fatalf("error string should not include reject-reason when header absent; got: %s", err.Error())
 	}
 }
 
