@@ -3,6 +3,7 @@ package pubsub
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -11,6 +12,33 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+// ErrUnauthorized is the sentinel returned when a websocket dial is
+// rejected with HTTP 401. Match with errors.Is.
+var ErrUnauthorized = errors.New("websocket dial unauthorized")
+
+// DialError wraps a websocket dial failure together with the HTTP status
+// code from the response (0 if no response was received).
+type DialError struct {
+	Err        error
+	StatusCode int
+}
+
+func (e *DialError) Error() string {
+	if e.StatusCode != 0 {
+		return fmt.Sprintf("DialContext dial: %s (status %d)", e.Err.Error(), e.StatusCode)
+	}
+	return fmt.Sprintf("DialContext dial: %s", e.Err.Error())
+}
+
+func (e *DialError) Unwrap() error { return e.Err }
+
+func (e *DialError) Is(target error) bool {
+	if target == ErrUnauthorized {
+		return e.StatusCode == http.StatusUnauthorized
+	}
+	return false
+}
 
 // Client is the websockets client.
 type Client struct {
@@ -261,12 +289,15 @@ func (c *Client) connect(ctx context.Context) (err error) {
 	}
 
 	u := url.URL{Scheme: wsScheme, Host: c.host, Path: p}
-	c.conn, _, err = c.Dialer.DialContext(ctx, u.String(), c.header)
+	conn, resp, err := c.Dialer.DialContext(ctx, u.String(), c.header)
 	if err != nil {
-		return fmt.Errorf("DialContext dial: %s", err.Error())
+		de := &DialError{Err: err}
+		if resp != nil {
+			de.StatusCode = resp.StatusCode
+		}
+		return de
 	}
-	//defer c.conn.Close()
-
+	c.conn = conn
 	return nil
 }
 

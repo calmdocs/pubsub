@@ -2,8 +2,11 @@ package pubsub
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +14,66 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 )
+
+// TestConnectUnauthorizedTyped asserts that a 401 from the WS upgrade is
+// surfaced as a *DialError matching ErrUnauthorized via errors.Is, with
+// the StatusCode populated and "status 401" present in the error string.
+func TestConnectUnauthorizedTyped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	host := strings.TrimPrefix(srv.URL, "http://")
+
+	c := NewClientWithBearerToken(host, "any-token", false, "/ws", "1")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := c.Start(ctx, func(message []byte) error { return nil })
+	if err == nil {
+		t.Fatalf("expected error from 401 dial, got nil")
+	}
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("expected errors.Is(err, ErrUnauthorized) to be true; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "status 401") {
+		t.Fatalf("expected error string to contain \"status 401\"; got: %s", err.Error())
+	}
+
+	var de *DialError
+	if !errors.As(err, &de) {
+		t.Fatalf("expected error to be a *DialError; got: %T", err)
+	}
+	if de.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected StatusCode 401; got %d", de.StatusCode)
+	}
+}
+
+// TestConnectGenericFailure asserts that a non-401 dial failure (no listener
+// on the target address) does NOT match ErrUnauthorized.
+func TestConnectGenericFailure(t *testing.T) {
+	// Bind a listener, immediately close it. Connecting to its address now
+	// fails without an HTTP response, so resp is nil and StatusCode is 0.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+
+	c := NewClientWithBearerToken(addr, "any-token", false, "/ws", "1")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = c.Start(ctx, func(message []byte) error { return nil })
+	if err == nil {
+		t.Fatalf("expected error from closed-listener dial, got nil")
+	}
+	if errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("expected errors.Is(err, ErrUnauthorized) to be false for non-401 failure; got: %v", err)
+	}
+}
 
 func TestClient(t *testing.T) {
 	parentCtx, parentCancel := context.WithCancel(context.Background())
